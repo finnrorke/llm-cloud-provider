@@ -6,11 +6,12 @@ docker run --rm \
   --ipc=host \
   --cap-add=SYS_PTRACE \
   --security-opt seccomp=unconfined \
-  -p 8000:8000 \
+  --network=host \
   -v ~/.cache/huggingface:/root/.cache/huggingface \
   -e VLLM_ROCM_USE_AITER=0 \
   vllm/vllm-openai-rocm:latest \
   --model Qwen/Qwen3-0.6B \
   --dtype auto \
   --enforce-eager \
-  --max-model-len 4096
+  --max-model-len 4096 \
+  --disable-frontend-multiprocessing
