@@ -1,10 +1,10 @@
 docker run --rm \
-  --device=/dev/kfd \ # Add the amd fusion driver
-  --device=/dev/dri \ # expose rendering nodes through the direct rendering infrastructure driver
-  --group-add video \ # Needs video and render to access the GPU device files
+  --device=/dev/kfd \
+  --device=/dev/dri \
+  --group-add video \
   --group-add render \
-  --ipc=host \ # Shares hosts memory namespace
-  --cap-add=SYS_PTRACE \ # ROCM debugging and profiling tool
+  --ipc=host \
+  --cap-add=SYS_PTRACE \
   --security-opt seccomp=unconfined \
   -p 8000:8000 \
   -v ~/.cache/huggingface:/root/.cache/huggingface \
