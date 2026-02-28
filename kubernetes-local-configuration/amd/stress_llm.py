@@ -21,44 +21,92 @@ BASE_URL_PROFILES = {
 }
 
 
+class SharedState:
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.issued = 0
+        self.total = 0
+        self.ok = 0
+        self.fail = 0
+        self.prompt_tokens = 0
+        self.completion_tokens = 0
+        self.total_tokens = 0
+        self.latencies = []
+
+    def should_issue_next(self, max_messages: int, stop_at: float) -> bool:
+        with self.lock:
+            if max_messages > 0 and self.issued >= max_messages:
+                return False
+            if max_messages == 0 and time.time() >= stop_at:
+                return False
+            self.issued += 1
+            return True
+
+    def mark_dispatched(self):
+        with self.lock:
+            self.issued += 1
+            return self.issued
+
+    def record_result(self, ok: bool, prompt_tokens: int, completion_tokens: int, total_tokens: int, latency_s: float):
+        with self.lock:
+            self.total += 1
+            if ok:
+                self.ok += 1
+            else:
+                self.fail += 1
+            self.prompt_tokens += prompt_tokens
+            self.completion_tokens += completion_tokens
+            self.total_tokens += total_tokens
+            self.latencies.append(latency_s)
+
+    def snapshot(self) -> dict:
+        with self.lock:
+            return {
+                "issued": self.issued,
+                "total": self.total,
+                "ok": self.ok,
+                "fail": self.fail,
+                "prompt_tokens": self.prompt_tokens,
+                "completion_tokens": self.completion_tokens,
+                "total_tokens": self.total_tokens,
+                "latencies": list(self.latencies),
+            }
+
+
 def parse_args():
-    p = argparse.ArgumentParser(description="Stress test an OpenAI-compatible vLLM endpoint.")
-    p.add_argument(
+    parser = argparse.ArgumentParser(description="Stress test an OpenAI-compatible vLLM endpoint.")
+    parser.add_argument(
         "--base-url-profile",
         choices=sorted(BASE_URL_PROFILES.keys()),
         default="cluster-ip",
         help="Named base URL profile.",
     )
-    p.add_argument(
+    parser.add_argument(
         "--base-url",
         default=None,
         help="Manual base URL override (without /v1). Takes precedence over --base-url-profile.",
     )
-    p.add_argument("--namespace", default="llm-amd", help="Kubernetes namespace used for pod discovery.")
-    p.add_argument("--pod", default=None, help="Pod name to target directly (builds base URL from pod IP).")
-    p.add_argument(
+    parser.add_argument("--namespace", default="llm-amd", help="Kubernetes namespace used for pod discovery.")
+    parser.add_argument("--pod", default=None, help="Pod name to target directly (builds base URL from pod IP).")
+    parser.add_argument(
         "--select-pod",
         action="store_true",
         help="Interactively select a compatible pod and target its pod IP:8000.",
     )
-    p.add_argument(
-        "--list-pods",
-        action="store_true",
-        help="List compatible pods in --namespace and exit.",
-    )
-    p.add_argument("--runs-dir", default=None, help="Directory where run status/results are saved.")
-    p.add_argument("--status", default=None, help="Show a saved run status by run ID and exit.")
-    p.add_argument("--list-runs", action="store_true", help="List saved runs and exit.")
-    p.add_argument("--model", default="Qwen/Qwen3-0.6B", help="Model name.")
-    p.add_argument("--duration", type=int, default=120, help="Test duration in seconds.")
-    p.add_argument("--messages", type=int, default=0, help="Fixed number of requests to send (0 disables).")
-    p.add_argument("--burst", action="store_true", help="Send all --messages requests at once.")
-    p.add_argument("--concurrency", type=int, default=8, help="Number of worker threads.")
-    p.add_argument("--qps", type=float, default=4.0, help="Global request rate cap.")
-    p.add_argument("--timeout", type=float, default=120.0, help="HTTP request timeout seconds.")
-    p.add_argument("--max-tokens", type=int, default=128, help="Generation max tokens.")
-    p.add_argument("--prompt", default="Explain one practical use of queue-depth autoscaling in two sentences.")
-    return p.parse_args()
+    parser.add_argument("--list-pods", action="store_true", help="List compatible pods in --namespace and exit.")
+    parser.add_argument("--runs-dir", default=None, help="Directory where run status/results are saved.")
+    parser.add_argument("--status", default=None, help="Show a saved run status by run ID and exit.")
+    parser.add_argument("--list-runs", action="store_true", help="List saved runs and exit.")
+    parser.add_argument("--model", default="Qwen/Qwen3-0.6B", help="Model name.")
+    parser.add_argument("--duration", type=int, default=120, help="Test duration in seconds.")
+    parser.add_argument("--messages", type=int, default=0, help="Fixed number of requests to send (0 disables).")
+    parser.add_argument("--burst", action="store_true", help="Send all --messages requests at once.")
+    parser.add_argument("--concurrency", type=int, default=8, help="Number of worker threads for paced mode.")
+    parser.add_argument("--qps", type=float, default=4.0, help="Global request rate cap for paced mode.")
+    parser.add_argument("--timeout", type=float, default=120.0, help="HTTP request timeout seconds.")
+    parser.add_argument("--max-tokens", type=int, default=128, help="Generation max tokens.")
+    parser.add_argument("--prompt", default="Explain one practical use of queue-depth autoscaling in two sentences.")
+    return parser.parse_args()
 
 
 def percentile(values, pct):
@@ -81,12 +129,12 @@ def classify_latency(p95_s):
     return "high (likely queued)"
 
 
-def default_runs_dir():
-    return Path(__file__).resolve().parent / "stress-runs"
-
-
 def iso_utc_now():
     return dt.datetime.now(dt.timezone.utc).isoformat()
+
+
+def default_runs_dir():
+    return Path(__file__).resolve().parent / "stress-runs"
 
 
 def ensure_runs_dir(path_value):
@@ -117,11 +165,11 @@ def list_saved_runs(runs_dir):
         except json.JSONDecodeError:
             print(f"{fpath.stem} invalid-json")
             continue
-        status = doc.get("status", "unknown")
-        started = doc.get("started_at", "")
-        completed = doc.get("completed_at", "")
-        total = doc.get("total_requests", 0)
-        print(f"{fpath.stem} status={status} started_at={started} completed_at={completed} total={total}")
+        print(
+            f"{fpath.stem} status={doc.get('status', 'unknown')} "
+            f"started_at={doc.get('started_at', '')} completed_at={doc.get('completed_at', '')} "
+            f"total={doc.get('total_requests', 0)}"
+        )
 
 
 def show_saved_run(runs_dir, run_id):
@@ -134,26 +182,27 @@ def show_saved_run(runs_dir, run_id):
 def discover_compatible_pods(namespace):
     cmd = ["kubectl", "-n", namespace, "get", "pods", "-o", "json"]
     try:
-        data = subprocess.check_output(cmd, text=True)
+        payload = subprocess.check_output(cmd, text=True)
     except (subprocess.CalledProcessError, FileNotFoundError) as exc:
         raise RuntimeError(f"Failed to query pods from namespace '{namespace}': {exc}") from exc
 
-    doc = json.loads(data)
-    compatible = []
+    doc = json.loads(payload)
+    pods = []
     for item in doc.get("items", []):
         metadata = item.get("metadata", {})
         status = item.get("status", {})
         spec = item.get("spec", {})
-        pod_name = metadata.get("name", "")
-        pod_ip = status.get("podIP")
-        if not pod_name or not pod_ip:
+
+        name = metadata.get("name", "")
+        ip = status.get("podIP")
+        if not name or not ip:
             continue
         if status.get("phase") != "Running":
             continue
 
         conditions = status.get("conditions", [])
-        is_ready = any(c.get("type") == "Ready" and c.get("status") == "True" for c in conditions)
-        if not is_ready:
+        ready = any(c.get("type") == "Ready" and c.get("status") == "True" for c in conditions)
+        if not ready:
             continue
 
         has_8000 = False
@@ -164,102 +213,107 @@ def discover_compatible_pods(namespace):
                     break
             if has_8000:
                 break
-        if not has_8000:
-            continue
 
-        compatible.append({"name": pod_name, "ip": pod_ip})
+        if has_8000:
+            pods.append({"name": name, "ip": ip})
 
-    compatible.sort(key=lambda x: x["name"])
-    return compatible
+    return sorted(pods, key=lambda x: x["name"])
 
 
 def select_pod_interactively(pods):
     if not pods:
         raise RuntimeError("No compatible pods found.")
+
     print("Compatible pods:")
     for idx, pod in enumerate(pods, start=1):
         print(f"{idx}. {pod['name']} ({pod['ip']})")
+
     while True:
         raw = input("Select pod number: ").strip()
         try:
-            choice = int(raw)
-            if 1 <= choice <= len(pods):
-                return pods[choice - 1]
+            selected = int(raw)
+            if 1 <= selected <= len(pods):
+                return pods[selected - 1]
         except ValueError:
             pass
         print("Invalid selection. Try again.")
 
 
-def main():
-    args = parse_args()
-    runs_dir = ensure_runs_dir(args.runs_dir)
-
-    if args.list_runs:
-        list_saved_runs(runs_dir)
-        sys.exit(0)
-
-    if args.status:
-        show_saved_run(runs_dir, args.status)
-        sys.exit(0)
-
-    compatible_pods = []
+def resolve_base_url(args):
+    pods = []
     if args.list_pods or args.select_pod or args.pod:
-        compatible_pods = discover_compatible_pods(args.namespace)
+        pods = discover_compatible_pods(args.namespace)
 
     if args.list_pods:
-        if not compatible_pods:
+        if not pods:
             print(f"No compatible pods found in namespace '{args.namespace}'.")
             sys.exit(1)
-        for pod in compatible_pods:
+        for pod in pods:
             print(f"{pod['name']} {pod['ip']}")
         sys.exit(0)
 
-    resolved_base_url = args.base_url or BASE_URL_PROFILES[args.base_url_profile]
+    base_url = args.base_url or BASE_URL_PROFILES[args.base_url_profile]
     selected_pod_name = None
 
     if args.pod:
-        selected = next((p for p in compatible_pods if p["name"] == args.pod), None)
+        selected = next((p for p in pods if p["name"] == args.pod), None)
         if not selected:
             raise RuntimeError(f"Pod '{args.pod}' is not compatible or not running in namespace '{args.namespace}'.")
+        base_url = f"http://{selected['ip']}:8000"
         selected_pod_name = selected["name"]
-        resolved_base_url = f"http://{selected['ip']}:8000"
     elif args.select_pod:
-        selected = select_pod_interactively(compatible_pods)
+        selected = select_pod_interactively(pods)
+        base_url = f"http://{selected['ip']}:8000"
         selected_pod_name = selected["name"]
-        resolved_base_url = f"http://{selected['ip']}:8000"
 
-    endpoint = f"{resolved_base_url.rstrip('/')}/v1/chat/completions"
-    start_ts = time.time()
-    stop_at = time.time() + args.duration
-    run_id = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ") + "-" + uuid.uuid4().hex[:8]
-    started_at = iso_utc_now()
-    max_messages = max(args.messages, 0)
-    if args.messages < 0:
-        raise RuntimeError("--messages must be >= 0")
-    if args.burst and max_messages <= 0:
-        raise RuntimeError("--burst requires --messages > 0")
+    return base_url, selected_pod_name
 
-    latencies = []
-    lock = threading.Lock()
-    total = 0
-    ok = 0
-    fail = 0
-    issued = 0
+
+def send_request(endpoint, body_bytes, timeout_s):
+    request = urllib.request.Request(
+        endpoint,
+        data=body_bytes,
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": "Bearer EMPTY",
+        },
+        method="POST",
+    )
+
+    start = time.time()
+    ok = False
     prompt_tokens = 0
     completion_tokens = 0
     total_tokens = 0
 
-    # Per-worker throttle. Approximate global QPS by splitting budget across workers.
-    per_worker_qps = max(args.qps / max(args.concurrency, 1), 0.001)
-    per_worker_interval = 1.0 / per_worker_qps
+    try:
+        with urllib.request.urlopen(request, timeout=timeout_s) as response:
+            payload_raw = response.read()
+            ok = 200 <= response.status < 300
+            if ok:
+                try:
+                    usage = json.loads(payload_raw.decode("utf-8")).get("usage", {})
+                    prompt_tokens = int(usage.get("prompt_tokens", 0) or 0)
+                    completion_tokens = int(usage.get("completion_tokens", 0) or 0)
+                    total_tokens = int(usage.get("total_tokens", prompt_tokens + completion_tokens) or 0)
+                except (ValueError, TypeError, json.JSONDecodeError):
+                    prompt_tokens = 0
+                    completion_tokens = 0
+                    total_tokens = 0
+    except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError):
+        ok = False
 
-    initial_status = {
+    return ok, prompt_tokens, completion_tokens, total_tokens, time.time() - start
+
+
+def build_initial_status(args, run_id, started_at, base_url, selected_pod, endpoint, max_messages):
+    return {
         "run_id": run_id,
         "status": "running",
         "started_at": started_at,
         "completed_at": None,
-        "base_url": resolved_base_url,
-        "selected_pod": selected_pod_name,
+        "base_url": base_url,
+        "selected_pod": selected_pod,
         "endpoint": endpoint,
         "model": args.model,
         "duration_s": args.duration,
@@ -274,6 +328,7 @@ def main():
         "fail": 0,
         "success_rate_pct": 0.0,
         "achieved_rps": 0.0,
+        "elapsed_s": 0.0,
         "prompt_tokens": 0,
         "completion_tokens": 0,
         "total_tokens": 0,
@@ -286,181 +341,51 @@ def main():
         "latency_p99_s": 0.0,
         "updated_at": iso_utc_now(),
     }
-    save_run_status(runs_dir, run_id, initial_status)
-    print(f"run_id={run_id}")
-    print(f"run_status_file={run_path(runs_dir, run_id)}")
 
-    def send_request():
-        payload = {
-            "model": args.model,
-            "messages": [{"role": "user", "content": args.prompt}],
-            "max_tokens": args.max_tokens,
-            "temperature": 0.7,
-        }
-        body = json.dumps(payload).encode("utf-8")
-        req = urllib.request.Request(
-            endpoint,
-            data=body,
-            headers={
-                "Content-Type": "application/json",
-                "Authorization": "Bearer EMPTY",
-            },
-            method="POST",
-        )
 
-        t0 = time.time()
-        local_ok = False
-        pt = 0
-        ct = 0
-        tt = 0
-        try:
-            with urllib.request.urlopen(req, timeout=args.timeout) as resp:
-                payload_raw = resp.read()
-                local_ok = (200 <= resp.status < 300)
-                if local_ok:
-                    try:
-                        payload_json = json.loads(payload_raw.decode("utf-8"))
-                        usage = payload_json.get("usage", {})
-                        pt = int(usage.get("prompt_tokens", 0) or 0)
-                        ct = int(usage.get("completion_tokens", 0) or 0)
-                        tt = int(usage.get("total_tokens", pt + ct) or (pt + ct))
-                    except (ValueError, TypeError, json.JSONDecodeError):
-                        pt = 0
-                        ct = 0
-                        tt = 0
-        except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError):
-            local_ok = False
-        elapsed = time.time() - t0
-        return local_ok, pt, ct, tt, elapsed
+def build_status_from_state(base_status, state_snapshot, elapsed_s, status, completed_at=None):
+    total = state_snapshot["total"]
+    ok = state_snapshot["ok"]
+    fail = state_snapshot["fail"]
+    prompt_tokens = state_snapshot["prompt_tokens"]
+    completion_tokens = state_snapshot["completion_tokens"]
+    total_tokens = state_snapshot["total_tokens"]
+    latencies = sorted(state_snapshot["latencies"])
 
-    def worker(worker_id):
-        nonlocal total, ok, fail, issued, prompt_tokens, completion_tokens, total_tokens
-        next_fire = time.time() + random.uniform(0, per_worker_interval)
-        while True:
-            with lock:
-                if max_messages > 0 and issued >= max_messages:
-                    break
-                if max_messages == 0 and time.time() >= stop_at:
-                    break
-                issued += 1
-
-            now = time.time()
-            if now < next_fire:
-                time.sleep(next_fire - now)
-            next_fire += per_worker_interval
-
-            local_ok, pt, ct, tt, elapsed = send_request()
-
-            with lock:
-                total += 1
-                if local_ok:
-                    ok += 1
-                else:
-                    fail += 1
-                latencies.append(elapsed)
-                prompt_tokens += pt
-                completion_tokens += ct
-                total_tokens += tt
-
-    start_burst = threading.Event()
-    dispatched_burst = threading.Event()
-    dispatched_count = 0
-
-    def burst_worker():
-        nonlocal total, ok, fail, issued, prompt_tokens, completion_tokens, total_tokens, dispatched_count
-        start_burst.wait()
-        with lock:
-            issued += 1
-            dispatched_count += 1
-            if dispatched_count >= max_messages:
-                dispatched_burst.set()
-        local_ok, pt, ct, tt, elapsed = send_request()
-        with lock:
-            total += 1
-            if local_ok:
-                ok += 1
-            else:
-                fail += 1
-            latencies.append(elapsed)
-            prompt_tokens += pt
-            completion_tokens += ct
-            total_tokens += tt
-
-    stop_progress = threading.Event()
-
-    def progress_writer():
-        while not stop_progress.is_set():
-            with lock:
-                elapsed_now = max(time.time() - start_ts, 0.001)
-                success_rate_now = (ok / total * 100.0) if total else 0.0
-                snapshot = {
-                    **initial_status,
-                    "status": "running",
-                    "total_requests": total,
-                    "success": ok,
-                    "fail": fail,
-                    "success_rate_pct": round(success_rate_now, 2),
-                    "achieved_rps": round(total / elapsed_now, 3),
-                    "prompt_tokens": prompt_tokens,
-                    "completion_tokens": completion_tokens,
-                    "total_tokens": total_tokens,
-                    "prompt_tokens_per_s": round(prompt_tokens / elapsed_now, 3),
-                    "completion_tokens_per_s": round(completion_tokens / elapsed_now, 3),
-                    "total_tokens_per_s": round(total_tokens / elapsed_now, 3),
-                    "updated_at": iso_utc_now(),
-                }
-            save_run_status(runs_dir, run_id, snapshot)
-            stop_progress.wait(1.0)
-
-    progress_thread = threading.Thread(target=progress_writer, daemon=True)
-    progress_thread.start()
-    if args.burst:
-        threads = [threading.Thread(target=burst_worker, daemon=True) for _ in range(max_messages)]
-    else:
-        threads = [threading.Thread(target=worker, args=(i,), daemon=True) for i in range(args.concurrency)]
-    for t in threads:
-        t.start()
-    if args.burst:
-        start_ts = time.time()
-        print(f"burst_releasing_requests={max_messages}")
-        start_burst.set()
-        dispatched_burst.wait(timeout=10.0)
-        print(f"all_requests_dispatched={max_messages}")
-    for t in threads:
-        t.join()
-    stop_progress.set()
-    progress_thread.join(timeout=2.0)
-
-    lat_sorted = sorted(latencies)
-    elapsed_total = max(time.time() - start_ts, 1e-6)
+    safe_elapsed = max(elapsed_s, 1e-6)
     success_rate = (ok / total * 100.0) if total else 0.0
-    achieved_rps = total / elapsed_total
-    completed_at = iso_utc_now()
+    achieved_rps = total / safe_elapsed
 
-    final_status = {
-        **initial_status,
-        "status": "completed",
+    return {
+        **base_status,
+        "status": status,
         "completed_at": completed_at,
         "total_requests": total,
         "success": ok,
         "fail": fail,
         "success_rate_pct": round(success_rate, 2),
         "achieved_rps": round(achieved_rps, 3),
+        "elapsed_s": round(safe_elapsed, 3),
         "prompt_tokens": prompt_tokens,
         "completion_tokens": completion_tokens,
         "total_tokens": total_tokens,
-        "prompt_tokens_per_s": round(prompt_tokens / elapsed_total, 3),
-        "completion_tokens_per_s": round(completion_tokens / elapsed_total, 3),
-        "total_tokens_per_s": round(total_tokens / elapsed_total, 3),
-        "latency_avg_s": round(statistics.mean(lat_sorted) if lat_sorted else 0.0, 3),
-        "latency_p50_s": round(percentile(lat_sorted, 0.50), 3),
-        "latency_p95_s": round(percentile(lat_sorted, 0.95), 3),
-        "latency_p99_s": round(percentile(lat_sorted, 0.99), 3),
-        "updated_at": completed_at,
+        "prompt_tokens_per_s": round(prompt_tokens / safe_elapsed, 3),
+        "completion_tokens_per_s": round(completion_tokens / safe_elapsed, 3),
+        "total_tokens_per_s": round(total_tokens / safe_elapsed, 3),
+        "latency_avg_s": round(statistics.mean(latencies) if latencies else 0.0, 3),
+        "latency_p50_s": round(percentile(latencies, 0.50), 3),
+        "latency_p95_s": round(percentile(latencies, 0.95), 3),
+        "latency_p99_s": round(percentile(latencies, 0.99), 3),
+        "updated_at": iso_utc_now() if status == "running" else completed_at,
     }
-    save_run_status(runs_dir, run_id, final_status)
 
-    print(f"base_url={resolved_base_url}")
+
+def print_results(args, base_url, selected_pod_name, endpoint, started_at, completed_at, final_status):
+    total = final_status["total_requests"]
+    ok = final_status["success"]
+    fail = final_status["fail"]
+
+    print(f"base_url={base_url}")
     if selected_pod_name:
         print(f"selected_pod={selected_pod_name}")
     print(f"endpoint={endpoint}")
@@ -471,33 +396,159 @@ def main():
     print(f"total_requests={total}")
     print(f"success={ok}")
     print(f"fail={fail}")
-    print(f"success_rate_pct={success_rate:.2f}")
-    print(f"achieved_rps={achieved_rps:.2f}")
-    print(f"prompt_tokens={prompt_tokens}")
-    print(f"completion_tokens={completion_tokens}")
-    print(f"total_tokens={total_tokens}")
-    print(f"prompt_tokens_per_s={prompt_tokens / elapsed_total:.2f}")
-    print(f"completion_tokens_per_s={completion_tokens / elapsed_total:.2f}")
-    print(f"total_tokens_per_s={total_tokens / elapsed_total:.2f}")
-    print(f"latency_avg_s={statistics.mean(lat_sorted) if lat_sorted else 0.0:.3f}")
-    print(f"avg_reply_time_s={statistics.mean(lat_sorted) if lat_sorted else 0.0:.3f}")
-    print(f"latency_p50_s={percentile(lat_sorted, 0.50):.3f}")
-    print(f"latency_p95_s={percentile(lat_sorted, 0.95):.3f}")
-    print(f"latency_p99_s={percentile(lat_sorted, 0.99):.3f}")
+    print(f"success_rate_pct={final_status['success_rate_pct']:.2f}")
+    print(f"achieved_rps={final_status['achieved_rps']:.2f}")
+    print(f"prompt_tokens={final_status['prompt_tokens']}")
+    print(f"completion_tokens={final_status['completion_tokens']}")
+    print(f"total_tokens={final_status['total_tokens']}")
+    print(f"prompt_tokens_per_s={final_status['prompt_tokens_per_s']:.2f}")
+    print(f"completion_tokens_per_s={final_status['completion_tokens_per_s']:.2f}")
+    print(f"total_tokens_per_s={final_status['total_tokens_per_s']:.2f}")
+    print(f"latency_avg_s={final_status['latency_avg_s']:.3f}")
+    print(f"avg_reply_time_s={final_status['latency_avg_s']:.3f}")
+    print(f"latency_p50_s={final_status['latency_p50_s']:.3f}")
+    print(f"latency_p95_s={final_status['latency_p95_s']:.3f}")
+    print(f"latency_p99_s={final_status['latency_p99_s']:.3f}")
     print(f"started_at={started_at}")
     print(f"completed_at={completed_at}")
     print()
     print("summary:")
-    print(f"- requests: {total} total ({ok} success, {fail} fail, {success_rate:.2f}% success)")
-    print(f"- time: {elapsed_total:.2f}s total ({started_at} -> {completed_at})")
-    print(f"- throughput: {achieved_rps:.2f} req/s, {total_tokens / elapsed_total:.2f} tok/s")
+    print(f"- requests: {total} total ({ok} success, {fail} fail, {final_status['success_rate_pct']:.2f}% success)")
+    print(f"- time: {final_status['elapsed_s']:.2f}s ({started_at} -> {completed_at})")
     print(
-        f"- latency: avg {statistics.mean(lat_sorted) if lat_sorted else 0.0:.3f}s, "
-        f"p50 {percentile(lat_sorted, 0.50):.3f}s, "
-        f"p95 {percentile(lat_sorted, 0.95):.3f}s, "
-        f"p99 {percentile(lat_sorted, 0.99):.3f}s"
+        f"- throughput: {final_status['achieved_rps']:.2f} req/s, "
+        f"{final_status['total_tokens_per_s']:.2f} tok/s"
     )
-    print(f"- latency_profile: {classify_latency(percentile(lat_sorted, 0.95))}")
+    print(
+        f"- latency: avg {final_status['latency_avg_s']:.3f}s, "
+        f"p50 {final_status['latency_p50_s']:.3f}s, "
+        f"p95 {final_status['latency_p95_s']:.3f}s, "
+        f"p99 {final_status['latency_p99_s']:.3f}s"
+    )
+    print(f"- latency_profile: {classify_latency(final_status['latency_p95_s'])}")
+
+
+def main():
+    args = parse_args()
+    runs_dir = ensure_runs_dir(args.runs_dir)
+
+    if args.list_runs:
+        list_saved_runs(runs_dir)
+        return
+
+    if args.status:
+        show_saved_run(runs_dir, args.status)
+        return
+
+    if args.messages < 0:
+        raise RuntimeError("--messages must be >= 0")
+    if args.burst and args.messages <= 0:
+        raise RuntimeError("--burst requires --messages > 0")
+
+    base_url, selected_pod_name = resolve_base_url(args)
+    endpoint = f"{base_url.rstrip('/')}/v1/chat/completions"
+    run_id = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ") + "-" + uuid.uuid4().hex[:8]
+    started_at = iso_utc_now()
+    started_ts = time.time()
+    stop_at = started_ts + args.duration
+
+    base_status = build_initial_status(
+        args=args,
+        run_id=run_id,
+        started_at=started_at,
+        base_url=base_url,
+        selected_pod=selected_pod_name,
+        endpoint=endpoint,
+        max_messages=max(args.messages, 0),
+    )
+    save_run_status(runs_dir, run_id, base_status)
+    print(f"run_id={run_id}")
+    print(f"run_status_file={run_path(runs_dir, run_id)}")
+
+    payload = {
+        "model": args.model,
+        "messages": [{"role": "user", "content": args.prompt}],
+        "max_tokens": args.max_tokens,
+        "temperature": 0.7,
+    }
+    body_bytes = json.dumps(payload).encode("utf-8")
+
+    state = SharedState()
+    stop_progress = threading.Event()
+    start_burst = threading.Event()
+    dispatched_burst = threading.Event()
+
+    per_worker_qps = max(args.qps / max(args.concurrency, 1), 0.001)
+    per_worker_interval = 1.0 / per_worker_qps
+
+    def paced_worker():
+        next_fire = time.time() + random.uniform(0, per_worker_interval)
+        while state.should_issue_next(max(args.messages, 0), stop_at):
+            now = time.time()
+            if now < next_fire:
+                time.sleep(next_fire - now)
+            next_fire += per_worker_interval
+            result = send_request(endpoint, body_bytes, args.timeout)
+            state.record_result(*result)
+
+    def burst_worker(total_messages):
+        start_burst.wait()
+        dispatched = state.mark_dispatched()
+        if dispatched >= total_messages:
+            dispatched_burst.set()
+        result = send_request(endpoint, body_bytes, args.timeout)
+        state.record_result(*result)
+
+    def progress_writer(start_reference):
+        while not stop_progress.is_set():
+            elapsed = max(time.time() - start_reference[0], 0.001)
+            running_status = build_status_from_state(
+                base_status,
+                state.snapshot(),
+                elapsed,
+                status="running",
+            )
+            save_run_status(runs_dir, run_id, running_status)
+            stop_progress.wait(1.0)
+
+    start_reference = [started_ts]
+    progress_thread = threading.Thread(target=progress_writer, args=(start_reference,), daemon=True)
+    progress_thread.start()
+
+    if args.burst:
+        total_messages = args.messages
+        threads = [threading.Thread(target=burst_worker, args=(total_messages,), daemon=True) for _ in range(total_messages)]
+    else:
+        threads = [threading.Thread(target=paced_worker, daemon=True) for _ in range(args.concurrency)]
+
+    for thread in threads:
+        thread.start()
+
+    if args.burst:
+        start_reference[0] = time.time()
+        print(f"burst_releasing_requests={args.messages}")
+        start_burst.set()
+        dispatched_burst.wait(timeout=10.0)
+        print(f"all_requests_dispatched={args.messages}")
+
+    for thread in threads:
+        thread.join()
+
+    stop_progress.set()
+    progress_thread.join(timeout=2.0)
+
+    completed_at = iso_utc_now()
+    elapsed_total = max(time.time() - start_reference[0], 1e-6)
+    final_status = build_status_from_state(
+        base_status,
+        state.snapshot(),
+        elapsed_total,
+        status="completed",
+        completed_at=completed_at,
+    )
+    save_run_status(runs_dir, run_id, final_status)
+
+    print_results(args, base_url, selected_pod_name, endpoint, started_at, completed_at, final_status)
 
 
 if __name__ == "__main__":
