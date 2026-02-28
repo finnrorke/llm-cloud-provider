@@ -1,0 +1,7 @@
+{
+  "base_url": "http://10.43.167.147:8000",
+  "duration": 180,
+  "concurrency": 16,
+  "qps": 12,
+  "timeout": 120
+}

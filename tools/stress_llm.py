@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-import argparse
 import datetime as dt
 import json
 import os
@@ -12,13 +11,42 @@ import time
 import urllib.error
 import urllib.request
 import uuid
+from dataclasses import dataclass
 from pathlib import Path
 
-BASE_URL_PROFILES = {
+try:
+    from .common import load_json, require_run_config_path, resolve_path, run_config_args
+except ImportError:
+    from common import load_json, require_run_config_path, resolve_path, run_config_args
+
+
+DEFAULT_BASE_URL_PROFILES = {
     "localhost": "http://127.0.0.1:8000",
     "cluster-ip": "http://10.43.167.147:8000",
     "k8s-service": "http://qwen3-0-8b-vllm.llm-amd.svc.cluster.local:8000",
 }
+
+
+@dataclass
+class StressConfig:
+    namespace: str
+    base_url_profile: str
+    base_url: str
+    pod: str
+    select_pod: bool
+    list_pods: bool
+    runs_dir: str
+    status: str
+    list_runs: bool
+    model: str
+    duration: int
+    messages: int
+    burst: bool
+    concurrency: int
+    qps: float
+    timeout: float
+    max_tokens: int
+    prompt: str
 
 
 class SharedState:
@@ -33,7 +61,7 @@ class SharedState:
         self.total_tokens = 0
         self.latencies = []
 
-    def should_issue_next(self, max_messages: int, stop_at: float) -> bool:
+    def try_issue(self, max_messages, stop_at):
         with self.lock:
             if max_messages > 0 and self.issued >= max_messages:
                 return False
@@ -47,7 +75,7 @@ class SharedState:
             self.issued += 1
             return self.issued
 
-    def record_result(self, ok: bool, prompt_tokens: int, completion_tokens: int, total_tokens: int, latency_s: float):
+    def record(self, ok, prompt_tokens, completion_tokens, total_tokens, latency_s):
         with self.lock:
             self.total += 1
             if ok:
@@ -59,7 +87,7 @@ class SharedState:
             self.total_tokens += total_tokens
             self.latencies.append(latency_s)
 
-    def snapshot(self) -> dict:
+    def snapshot(self):
         with self.lock:
             return {
                 "issued": self.issued,
@@ -71,42 +99,6 @@ class SharedState:
                 "total_tokens": self.total_tokens,
                 "latencies": list(self.latencies),
             }
-
-
-def parse_args():
-    parser = argparse.ArgumentParser(description="Stress test an OpenAI-compatible vLLM endpoint.")
-    parser.add_argument(
-        "--base-url-profile",
-        choices=sorted(BASE_URL_PROFILES.keys()),
-        default="cluster-ip",
-        help="Named base URL profile.",
-    )
-    parser.add_argument(
-        "--base-url",
-        default=None,
-        help="Manual base URL override (without /v1). Takes precedence over --base-url-profile.",
-    )
-    parser.add_argument("--namespace", default="llm-amd", help="Kubernetes namespace used for pod discovery.")
-    parser.add_argument("--pod", default=None, help="Pod name to target directly (builds base URL from pod IP).")
-    parser.add_argument(
-        "--select-pod",
-        action="store_true",
-        help="Interactively select a compatible pod and target its pod IP:8000.",
-    )
-    parser.add_argument("--list-pods", action="store_true", help="List compatible pods in --namespace and exit.")
-    parser.add_argument("--runs-dir", default=None, help="Directory where run status/results are saved.")
-    parser.add_argument("--status", default=None, help="Show a saved run status by run ID and exit.")
-    parser.add_argument("--list-runs", action="store_true", help="List saved runs and exit.")
-    parser.add_argument("--model", default="Qwen/Qwen3-0.6B", help="Model name.")
-    parser.add_argument("--duration", type=int, default=120, help="Test duration in seconds.")
-    parser.add_argument("--messages", type=int, default=0, help="Fixed number of requests to send (0 disables).")
-    parser.add_argument("--burst", action="store_true", help="Send all --messages requests at once.")
-    parser.add_argument("--concurrency", type=int, default=8, help="Number of worker threads for paced mode.")
-    parser.add_argument("--qps", type=float, default=4.0, help="Global request rate cap for paced mode.")
-    parser.add_argument("--timeout", type=float, default=120.0, help="HTTP request timeout seconds.")
-    parser.add_argument("--max-tokens", type=int, default=128, help="Generation max tokens.")
-    parser.add_argument("--prompt", default="Explain one practical use of queue-depth autoscaling in two sentences.")
-    return parser.parse_args()
 
 
 def percentile(values, pct):
@@ -133,12 +125,88 @@ def iso_utc_now():
     return dt.datetime.now(dt.timezone.utc).isoformat()
 
 
-def default_runs_dir():
-    return Path(__file__).resolve().parent / "stress-runs"
+DEFAULTS = {
+    "namespace": "llm-amd",
+    "base_url_profile": "cluster-ip",
+    "base_url": "",
+    "pod": "",
+    "select_pod": False,
+    "list_pods": False,
+    "model": "Qwen/Qwen3-0.6B",
+    "duration": 120,
+    "messages": 0,
+    "burst": False,
+    "concurrency": 8,
+    "qps": 4.0,
+    "timeout": 120.0,
+    "max_tokens": 128,
+    "prompt": "Explain one practical use of queue-depth autoscaling in two sentences.",
+    "runs_dir": "../../stress-runs",
+    "status": "",
+    "list_runs": False,
+}
+
+
+def _as_bool(value, field_name):
+    if isinstance(value, bool):
+        return value
+    raise RuntimeError(f"{field_name} must be true or false")
+
+
+def load_stress_config(argv=None):
+    run_cfg_path = require_run_config_path(argv, script_name="stress_llm.py")
+
+    run_cfg = load_json(run_cfg_path, required=True)
+    run_args = run_config_args(run_cfg)
+    base_url_profiles = dict(DEFAULT_BASE_URL_PROFILES)
+    defaults = dict(DEFAULTS)
+    defaults.update({key: value for key, value in run_args.items() if key in defaults})
+    if defaults["base_url_profile"] not in base_url_profiles:
+        known = ", ".join(sorted(base_url_profiles))
+        raise RuntimeError(f"Unknown base_url_profile '{defaults['base_url_profile']}'. Known profiles: {known}")
+
+    run_cfg_dir = Path(run_cfg_path).resolve().parent
+    cfg = StressConfig(
+        namespace=str(defaults["namespace"]),
+        base_url_profile=str(defaults["base_url_profile"]),
+        base_url=str(defaults["base_url"]),
+        pod=str(defaults["pod"] or ""),
+        select_pod=_as_bool(defaults["select_pod"], "select_pod"),
+        list_pods=_as_bool(defaults["list_pods"], "list_pods"),
+        runs_dir=str(resolve_path(defaults["runs_dir"], base_dir=run_cfg_dir)),
+        status=str(defaults["status"] or ""),
+        list_runs=_as_bool(defaults["list_runs"], "list_runs"),
+        model=str(defaults["model"]),
+        duration=int(defaults["duration"]),
+        messages=int(defaults["messages"]),
+        burst=_as_bool(defaults["burst"], "burst"),
+        concurrency=int(defaults["concurrency"]),
+        qps=float(defaults["qps"]),
+        timeout=float(defaults["timeout"]),
+        max_tokens=int(defaults["max_tokens"]),
+        prompt=str(defaults["prompt"]),
+    )
+
+    if cfg.messages < 0:
+        raise RuntimeError("messages must be >= 0")
+    if cfg.burst and cfg.messages <= 0:
+        raise RuntimeError("burst mode requires messages > 0")
+    if cfg.duration <= 0:
+        raise RuntimeError("duration must be > 0")
+    if cfg.concurrency <= 0:
+        raise RuntimeError("concurrency must be > 0")
+    if cfg.timeout <= 0:
+        raise RuntimeError("timeout must be > 0")
+    if cfg.max_tokens <= 0:
+        raise RuntimeError("max_tokens must be > 0")
+    if not cfg.burst and cfg.qps <= 0:
+        raise RuntimeError("qps must be > 0 in paced mode")
+
+    return cfg, base_url_profiles
 
 
 def ensure_runs_dir(path_value):
-    path = Path(path_value) if path_value else default_runs_dir()
+    path = Path(path_value)
     path.mkdir(parents=True, exist_ok=True)
     return path
 
@@ -195,9 +263,7 @@ def discover_compatible_pods(namespace):
 
         name = metadata.get("name", "")
         ip = status.get("podIP")
-        if not name or not ip:
-            continue
-        if status.get("phase") != "Running":
+        if not name or not ip or status.get("phase") != "Running":
             continue
 
         conditions = status.get("conditions", [])
@@ -239,7 +305,7 @@ def select_pod_interactively(pods):
         print("Invalid selection. Try again.")
 
 
-def resolve_base_url(args):
+def resolve_base_url(args, base_url_profiles):
     pods = []
     if args.list_pods or args.select_pod or args.pod:
         pods = discover_compatible_pods(args.namespace)
@@ -252,21 +318,21 @@ def resolve_base_url(args):
             print(f"{pod['name']} {pod['ip']}")
         sys.exit(0)
 
-    base_url = args.base_url or BASE_URL_PROFILES[args.base_url_profile]
-    selected_pod_name = None
+    base_url = args.base_url or base_url_profiles[args.base_url_profile]
+    selected_pod = None
 
     if args.pod:
         selected = next((p for p in pods if p["name"] == args.pod), None)
         if not selected:
             raise RuntimeError(f"Pod '{args.pod}' is not compatible or not running in namespace '{args.namespace}'.")
         base_url = f"http://{selected['ip']}:8000"
-        selected_pod_name = selected["name"]
+        selected_pod = selected["name"]
     elif args.select_pod:
         selected = select_pod_interactively(pods)
         base_url = f"http://{selected['ip']}:8000"
-        selected_pod_name = selected["name"]
+        selected_pod = selected["name"]
 
-    return base_url, selected_pod_name
+    return base_url, selected_pod
 
 
 def send_request(endpoint, body_bytes, timeout_s):
@@ -306,7 +372,7 @@ def send_request(endpoint, body_bytes, timeout_s):
     return ok, prompt_tokens, completion_tokens, total_tokens, time.time() - start
 
 
-def build_initial_status(args, run_id, started_at, base_url, selected_pod, endpoint, max_messages):
+def build_base_status(args, run_id, started_at, base_url, selected_pod, endpoint):
     return {
         "run_id": run_id,
         "status": "running",
@@ -317,7 +383,7 @@ def build_initial_status(args, run_id, started_at, base_url, selected_pod, endpo
         "endpoint": endpoint,
         "model": args.model,
         "duration_s": args.duration,
-        "messages_target": max_messages,
+        "messages_target": args.messages,
         "burst_mode": args.burst,
         "concurrency": args.concurrency,
         "target_qps": args.qps,
@@ -343,18 +409,17 @@ def build_initial_status(args, run_id, started_at, base_url, selected_pod, endpo
     }
 
 
-def build_status_from_state(base_status, state_snapshot, elapsed_s, status, completed_at=None):
-    total = state_snapshot["total"]
-    ok = state_snapshot["ok"]
-    fail = state_snapshot["fail"]
-    prompt_tokens = state_snapshot["prompt_tokens"]
-    completion_tokens = state_snapshot["completion_tokens"]
-    total_tokens = state_snapshot["total_tokens"]
-    latencies = sorted(state_snapshot["latencies"])
+def status_from_state(base_status, snapshot, elapsed_s, status, completed_at=None):
+    total = snapshot["total"]
+    ok = snapshot["ok"]
+    fail = snapshot["fail"]
+    prompt_tokens = snapshot["prompt_tokens"]
+    completion_tokens = snapshot["completion_tokens"]
+    total_tokens = snapshot["total_tokens"]
+    latencies = sorted(snapshot["latencies"])
 
     safe_elapsed = max(elapsed_s, 1e-6)
     success_rate = (ok / total * 100.0) if total else 0.0
-    achieved_rps = total / safe_elapsed
 
     return {
         **base_status,
@@ -364,7 +429,7 @@ def build_status_from_state(base_status, state_snapshot, elapsed_s, status, comp
         "success": ok,
         "fail": fail,
         "success_rate_pct": round(success_rate, 2),
-        "achieved_rps": round(achieved_rps, 3),
+        "achieved_rps": round(total / safe_elapsed, 3),
         "elapsed_s": round(safe_elapsed, 3),
         "prompt_tokens": prompt_tokens,
         "completion_tokens": completion_tokens,
@@ -380,11 +445,7 @@ def build_status_from_state(base_status, state_snapshot, elapsed_s, status, comp
     }
 
 
-def print_results(args, base_url, selected_pod_name, endpoint, started_at, completed_at, final_status):
-    total = final_status["total_requests"]
-    ok = final_status["success"]
-    fail = final_status["fail"]
-
+def print_report(args, base_url, selected_pod_name, endpoint, started_at, completed_at, final_status):
     print(f"base_url={base_url}")
     if selected_pod_name:
         print(f"selected_pod={selected_pod_name}")
@@ -393,9 +454,9 @@ def print_results(args, base_url, selected_pod_name, endpoint, started_at, compl
     print(f"duration_s={args.duration}")
     print(f"concurrency={args.concurrency}")
     print(f"target_qps={args.qps}")
-    print(f"total_requests={total}")
-    print(f"success={ok}")
-    print(f"fail={fail}")
+    print(f"total_requests={final_status['total_requests']}")
+    print(f"success={final_status['success']}")
+    print(f"fail={final_status['fail']}")
     print(f"success_rate_pct={final_status['success_rate_pct']:.2f}")
     print(f"achieved_rps={final_status['achieved_rps']:.2f}")
     print(f"prompt_tokens={final_status['prompt_tokens']}")
@@ -413,7 +474,10 @@ def print_results(args, base_url, selected_pod_name, endpoint, started_at, compl
     print(f"completed_at={completed_at}")
     print()
     print("summary:")
-    print(f"- requests: {total} total ({ok} success, {fail} fail, {final_status['success_rate_pct']:.2f}% success)")
+    print(
+        f"- requests: {final_status['total_requests']} total "
+        f"({final_status['success']} success, {final_status['fail']} fail, {final_status['success_rate_pct']:.2f}% success)"
+    )
     print(f"- time: {final_status['elapsed_s']:.2f}s ({started_at} -> {completed_at})")
     print(
         f"- throughput: {final_status['achieved_rps']:.2f} req/s, "
@@ -428,39 +492,26 @@ def print_results(args, base_url, selected_pod_name, endpoint, started_at, compl
     print(f"- latency_profile: {classify_latency(final_status['latency_p95_s'])}")
 
 
-def main():
-    args = parse_args()
+def main(argv=None):
+    args, base_url_profiles = load_stress_config(argv)
     runs_dir = ensure_runs_dir(args.runs_dir)
 
     if args.list_runs:
         list_saved_runs(runs_dir)
         return
-
     if args.status:
         show_saved_run(runs_dir, args.status)
         return
 
-    if args.messages < 0:
-        raise RuntimeError("--messages must be >= 0")
-    if args.burst and args.messages <= 0:
-        raise RuntimeError("--burst requires --messages > 0")
-
-    base_url, selected_pod_name = resolve_base_url(args)
+    base_url, selected_pod_name = resolve_base_url(args, base_url_profiles)
     endpoint = f"{base_url.rstrip('/')}/v1/chat/completions"
+
     run_id = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ") + "-" + uuid.uuid4().hex[:8]
     started_at = iso_utc_now()
     started_ts = time.time()
     stop_at = started_ts + args.duration
 
-    base_status = build_initial_status(
-        args=args,
-        run_id=run_id,
-        started_at=started_at,
-        base_url=base_url,
-        selected_pod=selected_pod_name,
-        endpoint=endpoint,
-        max_messages=max(args.messages, 0),
-    )
+    base_status = build_base_status(args, run_id, started_at, base_url, selected_pod_name, endpoint)
     save_run_status(runs_dir, run_id, base_status)
     print(f"run_id={run_id}")
     print(f"run_status_file={run_path(runs_dir, run_id)}")
@@ -480,44 +531,36 @@ def main():
 
     per_worker_qps = max(args.qps / max(args.concurrency, 1), 0.001)
     per_worker_interval = 1.0 / per_worker_qps
+    start_reference = [started_ts]
 
     def paced_worker():
         next_fire = time.time() + random.uniform(0, per_worker_interval)
-        while state.should_issue_next(max(args.messages, 0), stop_at):
+        while state.try_issue(args.messages, stop_at):
             now = time.time()
             if now < next_fire:
                 time.sleep(next_fire - now)
             next_fire += per_worker_interval
-            result = send_request(endpoint, body_bytes, args.timeout)
-            state.record_result(*result)
+            state.record(*send_request(endpoint, body_bytes, args.timeout))
 
     def burst_worker(total_messages):
         start_burst.wait()
         dispatched = state.mark_dispatched()
         if dispatched >= total_messages:
             dispatched_burst.set()
-        result = send_request(endpoint, body_bytes, args.timeout)
-        state.record_result(*result)
+        state.record(*send_request(endpoint, body_bytes, args.timeout))
 
-    def progress_writer(start_reference):
+    def progress_writer():
         while not stop_progress.is_set():
             elapsed = max(time.time() - start_reference[0], 0.001)
-            running_status = build_status_from_state(
-                base_status,
-                state.snapshot(),
-                elapsed,
-                status="running",
-            )
+            running_status = status_from_state(base_status, state.snapshot(), elapsed, status="running")
             save_run_status(runs_dir, run_id, running_status)
             stop_progress.wait(1.0)
 
-    start_reference = [started_ts]
-    progress_thread = threading.Thread(target=progress_writer, args=(start_reference,), daemon=True)
+    progress_thread = threading.Thread(target=progress_writer, daemon=True)
     progress_thread.start()
 
     if args.burst:
-        total_messages = args.messages
-        threads = [threading.Thread(target=burst_worker, args=(total_messages,), daemon=True) for _ in range(total_messages)]
+        threads = [threading.Thread(target=burst_worker, args=(args.messages,), daemon=True) for _ in range(args.messages)]
     else:
         threads = [threading.Thread(target=paced_worker, daemon=True) for _ in range(args.concurrency)]
 
@@ -539,17 +582,15 @@ def main():
 
     completed_at = iso_utc_now()
     elapsed_total = max(time.time() - start_reference[0], 1e-6)
-    final_status = build_status_from_state(
-        base_status,
-        state.snapshot(),
-        elapsed_total,
-        status="completed",
-        completed_at=completed_at,
-    )
+    final_status = status_from_state(base_status, state.snapshot(), elapsed_total, status="completed", completed_at=completed_at)
     save_run_status(runs_dir, run_id, final_status)
 
-    print_results(args, base_url, selected_pod_name, endpoint, started_at, completed_at, final_status)
+    print_report(args, base_url, selected_pod_name, endpoint, started_at, completed_at, final_status)
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except RuntimeError as exc:
+        print(str(exc), file=sys.stderr)
+        sys.exit(1)

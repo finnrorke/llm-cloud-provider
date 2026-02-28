@@ -1,0 +1,7 @@
+{
+  "base_url": "http://10.43.167.147:8000",
+  "messages": 900,
+  "burst": true,
+  "timeout": 120,
+  "max_tokens": 128
+}
