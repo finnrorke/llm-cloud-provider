@@ -6,19 +6,19 @@ metadata:
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: qwen3-0-8b-vllm
+  name: qwen3-0-6b-vllm
   namespace: llm-amd
   labels:
-    app: qwen3-0-8b-vllm
+    app: qwen3-0-6b-vllm
 spec:
   replicas: 1
   selector:
     matchLabels:
-      app: qwen3-0-8b-vllm
+      app: qwen3-0-6b-vllm
   template:
     metadata:
       labels:
-        app: qwen3-0-8b-vllm
+        app: qwen3-0-6b-vllm
     spec:
       hostIPC: true
       containers:
@@ -37,9 +37,6 @@ spec:
         ports:
         - containerPort: 8000
           name: http
-        env:
-        - name: VLLM_ROCM_USE_AITER
-          value: "0"
         securityContext:
           privileged: true
           capabilities:
@@ -83,12 +80,12 @@ spec:
 apiVersion: v1
 kind: Service
 metadata:
-  name: qwen3-0-8b-vllm
+  name: qwen3-0-6b-vllm
   namespace: llm-amd
 spec:
   type: ClusterIP
   selector:
-    app: qwen3-0-8b-vllm
+    app: qwen3-0-6b-vllm
   ports:
   - name: http
     port: 8000

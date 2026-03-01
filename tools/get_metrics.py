@@ -8,11 +8,7 @@ import sys
 import time
 import urllib.request
 from dataclasses import dataclass
-
-try:
-    from .common import load_json, require_run_config_path, run_config_args
-except ImportError:
-    from common import load_json, require_run_config_path, run_config_args
+from common import load_json, require_run_config_path, run_config_args
 
 
 COLOR_NAME_TO_CURSES = {
