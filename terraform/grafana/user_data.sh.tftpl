@@ -1,0 +1,33 @@
+#!/bin/bash
+set -euxo pipefail
+
+exec > >(tee /var/log/user-data.log | logger -t user-data -s 2>/dev/console) 2>&1
+
+dnf install -y wget
+
+cat >/etc/yum.repos.d/grafana.repo <<'EOF'
+[grafana]
+name=grafana
+baseurl=https://rpm.grafana.com
+repo_gpgcheck=1
+enabled=1
+gpgcheck=1
+gpgkey=https://rpm.grafana.com/gpg.key
+sslverify=1
+sslcacert=/etc/pki/tls/certs/ca-bundle.crt
+EOF
+
+dnf install -y grafana
+
+mkdir -p /etc/systemd/system/grafana-server.service.d
+
+cat >/etc/systemd/system/grafana-server.service.d/override.conf <<EOF
+[Service]
+Environment=GF_SERVER_HTTP_ADDR="0.0.0.0"
+Environment=GF_SERVER_HTTP_PORT="${grafana_port}"
+Environment=GF_SECURITY_ADMIN_USER=${grafana_admin_user_json}
+Environment=GF_SECURITY_ADMIN_PASSWORD=${grafana_admin_password_json}
+EOF
+
+systemctl daemon-reload
+systemctl enable --now grafana-server
