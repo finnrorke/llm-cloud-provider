@@ -1,0 +1,8 @@
+bucket       = "example-terraform-state-bucket"
+key          = "example/dev/terraform.tfstate"
+region       = "eu-west-1"
+encrypt      = true
+use_lockfile = true
+
+# Optional if you prefer backend auth via config instead of AWS_PROFILE.
+# profile = "example-profile"

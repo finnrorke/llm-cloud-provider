@@ -1,0 +1,10 @@
+region                  = "eu-west-1"
+org_prefix              = "example"
+environment             = "dev"
+kubernetes_api_allowed_cidrs = [
+  "203.0.113.10/32",
+]
+kubernetes_nodeport_allowed_cidrs = [
+  "203.0.113.10/32",
+]
+cluster_token = "replace-me-with-a-long-random-shared-secret"
