@@ -1,0 +1,33 @@
+#!/bin/bash
+set -euxo pipefail
+
+export DEBIAN_FRONTEND=noninteractive
+
+if ! command -v curl >/dev/null 2>&1; then
+  apt-get update
+  apt-get install -y curl
+fi
+
+IMDS_TOKEN=$(curl -fsS -X PUT "http://169.254.169.254/latest/api/token" \
+  -H "X-aws-ec2-metadata-token-ttl-seconds: 21600")
+PRIVATE_IP=$(curl -fsS -H "X-aws-ec2-metadata-token: $${IMDS_TOKEN}" \
+  http://169.254.169.254/latest/meta-data/local-ipv4)
+
+mkdir -p /etc/rancher/k3s
+
+cat >/etc/rancher/k3s/config.yaml <<EOF
+server: https://${control_plane_host}:6443
+token: ${cluster_token}
+node-ip: $${PRIVATE_IP}
+node-label:
+  - nodepool=${node_pool}
+%{ if node_label_extra != "" ~}
+  - ${node_label_extra}
+%{ endif ~}
+EOF
+
+until curl -ksS https://${control_plane_host}:6443 >/dev/null; do
+  sleep 10
+done
+
+curl -sfL https://get.k3s.io | INSTALL_K3S_EXEC="agent" sh -
